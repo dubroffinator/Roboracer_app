@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Wall-following node for the AutoDRIVE RoboRacer simulator (v8).
+
+Steering
+  1. Centering PID on projected left/right wall distances (open track).
+  2. Gap steering toward the widest opening (wall ahead), blended in by how
+     close the wall ahead is.
+  3. Racing line: before a bend the centering target shifts toward the outside
+     (out-in-out); the gap layer turns in toward the apex.
+
+Turn sharpness
+  The gap layer tells us which way the track opens up. The angle between that
+  direction and straight ahead is the turn sharpness (0 = straight,
+  1 = `sharp_angle_deg` or more). It is computed every scan, before the wall
+  ahead is close. For speed decisions it is "sticky": it rises instantly but
+  falls back slowly, so one clean scan never unlocks full speed.
+
+Speed (re-evaluated every scan)
+  v_dist : fastest speed from which the car can still slow to `corner_speed`
+           before the nearest obstacle in its path (braking-distance profile).
+           Uses the full lidar range (`far_range_cap`) so a long straight is
+           actually seen as long, and reserves `reaction_time` of travel.
+  v_turn : speed allowed for the current turn sharpness. Straight = current
+           top speed, sharp turn = `corner_speed`, smoothly in between.
+  Straight boost (new in v8): on a long clear stretch with no turn ahead, the
+           car is centred and not steering, the top speed rises from
+           `max_throttle` toward `straight_throttle`. The boost drops
+           instantly when any of those conditions weaken and returns slowly.
+  The car targets the lowest of these, and brakes (negative throttle) when it
+  is faster than that.
+
+All tuning values are ROS parameters, e.g.:
+  ros2 run autodrive_roboracer wall_follow_node --ros-args -p straight_throttle:=0.6
+"""
+import math
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
+
+MAX_STEER_RAD = 0.52  # steering command of 1.0 = full lock = about 0.52 rad
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+class WallFollowNode(Node):
+    def __init__(self):
+        super().__init__('wall_follow_node')
+
+        # Centering PID
+        self.declare_parameter('kp', 1.0)
+        self.declare_parameter('kd', 0.25)
+        self.declare_parameter('ki', 0.1)
+        self.declare_parameter('i_max', 0.5)
+        self.declare_parameter('theta_deg', 50.0)
+        self.declare_parameter('lookahead', 0.8)
+        self.declare_parameter('pid_ref_speed', 8.0)       # m/s; PID output is scaled down above this (0 = off)
+        # Speed
+        self.declare_parameter('min_throttle', 0.08)
+        self.declare_parameter('max_throttle', 0.50)       # top speed when not on a long straight
+        self.declare_parameter('straight_throttle', 0.70)  # top speed on long clear straights (<= max_throttle disables boost)
+        self.declare_parameter('speed_per_throttle', 24.0)  # m/s per 1.0 throttle (from HUD readings)
+        self.declare_parameter('corner_speed', 2.0)        # m/s used for the sharpest turns
+        self.declare_parameter('brake_decel', 4.0)         # m/s^2 the car is assumed able to shed
+        self.declare_parameter('brake_dist', 0.8)          # metres kept in hand before the wall
+        self.declare_parameter('reaction_time', 0.10)      # s of travel reserved for latency, at current speed
+        self.declare_parameter('sharp_angle_deg', 50.0)    # turn angle that counts as "fully sharp"
+        self.declare_parameter('sharp_curve', 2.0)         # >1 = stay fast longer in mild bends
+        self.declare_parameter('sharp_release', 0.15)      # how fast the sticky sharpness falls back (0..1 per scan)
+        self.declare_parameter('car_half_width', 0.25)     # corridor half-width for the obstacle check
+        self.declare_parameter('far_half_width', 0.40)     # half-width of the swept strip used for speed (m)
+        self.declare_parameter('brake_margin', 0.3)        # m/s over the stopping profile before full braking
+        self.declare_parameter('max_brake', 0.4)           # most negative throttle; 0 disables braking
+        self.declare_parameter('brake_gain', 0.15)         # braking throttle per m/s of excess speed
+        self.declare_parameter('front_rise', 0.3)
+        # Straight boost: how "long, clear and straight" the road must be
+        self.declare_parameter('far_range_cap', 30.0)      # lidar range used for speed decisions (m)
+        self.declare_parameter('boost_start', 6.0)         # clear distance where the boost begins
+        self.declare_parameter('boost_full', 12.0)         # clear distance for the full boost
+        self.declare_parameter('boost_sharp_max', 0.25)    # sticky sharpness at which the boost is gone
+        self.declare_parameter('boost_steer_max', 0.35)    # |steer| at which the boost is gone
+        self.declare_parameter('boost_center_max', 0.5)    # |centering error| (m) at which the boost is gone
+        self.declare_parameter('boost_rise', 0.08)         # how fast the boost returns (0..1 per scan)
+        # Blend between PID (open track) and gap steering (wall ahead)
+        self.declare_parameter('blend_start', 3.0)
+        self.declare_parameter('blend_end', 1.5)
+        # Gap steering
+        self.declare_parameter('gap_fov_deg', 90.0)
+        self.declare_parameter('bubble', 0.4)
+        self.declare_parameter('bubble_max_deg', 40.0)
+        self.declare_parameter('gap_min_range', 1.0)
+        self.declare_parameter('gap_gain', 1.5)
+        # Racing line
+        self.declare_parameter('line_offset', 0.2)         # metres toward the outside; 0 = off
+        self.declare_parameter('line_smooth', 0.2)
+        # Misc
+        self.declare_parameter('range_cap', 10.0)          # lidar range used for steering
+        self.declare_parameter('log_period', 0.5)
+
+        self.pub_throttle = self.create_publisher(
+            Float32, '/autodrive/roboracer_1/throttle_command', 10)
+        self.pub_steer = self.create_publisher(
+            Float32, '/autodrive/roboracer_1/steering_command', 10)
+        self.sub_lidar = self.create_subscription(
+            LaserScan, '/autodrive/roboracer_1/lidar', self.on_scan, 10)
+        # Speed topic name is a best guess; if nothing arrives we estimate speed instead.
+        self.sub_speed = self.create_subscription(
+            Float32, '/autodrive/roboracer_1/speed', self.on_speed, 10)
+
+        self.prev_err = 0.0
+        self.prev_time = None
+        self.front_s = None
+        self.far_s = None
+        self.integral = 0.0
+        self.prev_sign = 0.0
+        self.line_bias = 0.0
+        self.sharp_s = 0.0
+        self.boost = 0.0
+        self.v_meas = 0.0
+        self.v_meas_time = None
+        self.v_est = 0.0
+        self.prev_v = None
+        self.decel_est = 0.0
+        self.last_throttle = 0.0
+        self.get_logger().info('wall_follow_node v8 started')
+
+    # ---- helpers -------------------------------------------------------
+    def on_speed(self, msg):
+        self.v_meas = float(msg.data)
+        self.v_meas_time = self.get_clock().now().nanoseconds * 1e-9
+
+    @staticmethod
+    def idx(scan, angle_deg):
+        i = int(round((math.radians(angle_deg) - scan.angle_min) / scan.angle_increment))
+        return max(0, min(len(scan.ranges) - 1, i))
+
+    def range_at(self, r, scan, angle_deg, half_window=2):
+        i = self.idx(scan, angle_deg)
+        return float(np.mean(r[max(0, i - half_window):i + half_window + 1]))
+
+    def future_wall_dist(self, r, scan, side, theta, lookahead):
+        """Distance to the wall on `side` (+1 left, -1 right), projected ahead."""
+        b = self.range_at(r, scan, side * 90.0)
+        a = self.range_at(r, scan, side * (90.0 - math.degrees(theta)))
+        denom = a * math.sin(theta)
+        if abs(denom) < 1e-6:
+            return b
+        alpha = math.atan2(a * math.cos(theta) - b, denom)
+        return b * math.cos(alpha) + lookahead * math.sin(alpha)
+
+    def gap_steer(self, r, scan):
+        """Return (steering command in [-1, 1], gap angle in rad; + = left)."""
+        p = self.get_parameter
+        inc = scan.angle_increment
+        n = len(r)
+        smooth = np.convolve(r, np.ones(9) / 9.0, mode='same')
+        angles = scan.angle_min + np.arange(n) * inc
+
+        lo = self.idx(scan, -p('gap_fov_deg').value)
+        hi = self.idx(scan, p('gap_fov_deg').value) + 1
+        sector = smooth[lo:hi].copy()
+
+        # Block out a bubble around the closest point so we never aim at it.
+        i_min = int(np.argmin(sector))
+        d_min = max(float(sector[i_min]), 0.1)
+        bub_ang = min(math.asin(min(1.0, p('bubble').value / d_min)),
+                      math.radians(p('bubble_max_deg').value))
+        bub = int(bub_ang / inc)
+        sector[max(0, i_min - bub):i_min + bub + 1] = 0.0
+
+        # Longest run of beams that are not blocked.
+        free = (sector > p('gap_min_range').value).astype(np.int8)
+        d = np.diff(np.concatenate(([0], free, [0])))
+        starts = np.where(d == 1)[0]
+        ends = np.where(d == -1)[0]
+        if len(starts) == 0:
+            # Nowhere to go: turn away from the closest point, treat as a very sharp turn.
+            away = -1.0 if angles[lo + i_min] > 0 else 1.0
+            return away, away * math.radians(p('sharp_angle_deg').value)
+
+        k = int(np.argmax(ends - starts))
+        s, e = int(starts[k]), int(ends[k])
+        mid = (s + e - 1) // 2
+        # "Farthest" = middle of all beams within 5% of the longest reading in
+        # the gap (argmax alone would pick the first beam when readings are capped).
+        seg = sector[s:e]
+        far = s + int(np.median(np.where(seg >= 0.95 * float(seg.max()))[0]))
+        target = (mid + far) // 2
+        angle = float(angles[lo + target])  # + = left
+        cmd = clamp(angle / MAX_STEER_RAD * p('gap_gain').value, -1.0, 1.0)
+        return cmd, angle
+
+    # ---- control -------------------------------------------------------
+    def on_scan(self, scan):
+        p = self.get_parameter
+        now = self.get_clock().now().nanoseconds * 1e-9
+
+        # Two views of the same scan: `r` (capped at range_cap) drives steering exactly
+        # as before; `r_far` (full sensor range) is only used to judge how far ahead is clear.
+        cap = min(scan.range_max, p('range_cap').value)
+        cap_far = min(scan.range_max, max(p('far_range_cap').value, cap))
+        r_raw = np.asarray(scan.ranges, dtype=np.float32)
+        r_raw = np.where(np.isfinite(r_raw), r_raw, scan.range_max)
+        r_far = np.clip(r_raw, scan.range_min, cap_far)
+        r = np.minimum(r_far, cap)
+        scan_angles = scan.angle_min + np.arange(len(r)) * scan.angle_increment
+
+        theta = math.radians(p('theta_deg').value)
+        left = self.future_wall_dist(r, scan, +1, theta, p('lookahead').value)
+        right = self.future_wall_dist(r, scan, -1, theta, p('lookahead').value)
+
+        # Clearance ahead, for STEERING (unchanged from v7) = the nearer of
+        #   (a) the closest beam within +-15 degrees, and
+        #   (b) the closest obstacle inside the car-wide corridor straight ahead.
+        # Drops are taken instantly, rises are smoothed.
+        front_cone = float(np.min(r[self.idx(scan, -15.0):self.idx(scan, 15.0) + 1]))
+        x = r * np.cos(scan_angles)
+        y = np.abs(r * np.sin(scan_angles))
+        in_corridor = (np.abs(scan_angles) < math.radians(80.0)) & (x > 0.0) \
+            & (y < p('car_half_width').value)
+        front_corr = float(x[in_corridor].min()) if in_corridor.any() else cap
+        front_raw = min(front_cone, front_corr)
+        if self.front_s is None or front_raw < self.front_s:
+            self.front_s = front_raw
+        else:
+            self.front_s += p('front_rise').value * (front_raw - self.front_s)
+        front = self.front_s
+
+        # Clearance ahead, for SPEED = the nearest obstacle inside the strip the car will
+        # sweep (a little wider than the car), out to the full lidar range. The +-15 degree
+        # cone is NOT used here: in a narrow track it sees the side walls only a few metres
+        # away and would cap the speed on every straight. Same smoothing: drops instant.
+        xf = r_far * np.cos(scan_angles)
+        yf = np.abs(r_far * np.sin(scan_angles))
+        in_path = (np.abs(scan_angles) < math.radians(80.0)) & (xf > 0.0) \
+            & (yf < max(p('far_half_width').value, p('car_half_width').value))
+        far_raw = float(xf[in_path].min()) if in_path.any() else cap_far
+        if self.far_s is None or far_raw < self.far_s:
+            self.far_s = far_raw
+        else:
+            self.far_s += p('front_rise').value * (far_raw - self.far_s)
+        front_far = self.far_s
+
+        # Gap direction every scan: steers near walls, and measures turn sharpness.
+        bs, be = p('blend_start').value, p('blend_end').value
+        w = clamp((bs - front) / max(bs - be, 1e-3), 0.0, 1.0)
+        gap, gap_angle = self.gap_steer(r, scan)
+        sharp_signed = clamp(gap_angle / math.radians(p('sharp_angle_deg').value), -1.0, 1.0)
+        sharp = abs(sharp_signed)  # 0 = straight, 1 = fully sharp turn
+        # Sticky sharpness for speed: up instantly, down slowly.
+        if sharp > self.sharp_s:
+            self.sharp_s = sharp
+        else:
+            self.sharp_s += p('sharp_release').value * (sharp - self.sharp_s)
+
+        # Racing line: before a bend, sit toward the outside (opposite the bend);
+        # fade out as the gap layer takes over and turns in toward the apex.
+        room = max(0.0, min(left, right) - 0.3)
+        target_bias = clamp(-p('line_offset').value * sharp_signed * (1.0 - w), -room, room)
+        self.line_bias += p('line_smooth').value * (target_bias - self.line_bias)
+
+        # Centering error; + = more room on the left. The bias shifts the target line.
+        err = clamp((left - right) / 2.0 + self.line_bias, -2.0, 2.0)
+
+        # Current speed: measured if the speed topic is live, otherwise estimated
+        # from what we have been commanding.
+        K = p('speed_per_throttle').value
+        self.v_est += 0.06 * (max(self.last_throttle, 0.0) * K - self.v_est)
+        if self.v_meas_time is not None and now - self.v_meas_time < 0.5:
+            v, src = self.v_meas, 'meas'
+        else:
+            v, src = self.v_est, 'est'
+
+        if self.prev_time is None:
+            dt = 0.0
+            derr = 0.0
+        else:
+            dt = clamp(now - self.prev_time, 1e-3, 0.2)
+            derr = clamp((err - self.prev_err) / dt, -5.0, 5.0)
+        self.prev_err, self.prev_time = err, now
+
+        # PID with anti-windup; integral cleared when gap layer takes over or error flips sign.
+        if w > 0.5 or (err * self.prev_sign < 0.0):
+            self.integral = 0.0
+        else:
+            i_max = p('i_max').value
+            self.integral = clamp(self.integral + err * dt, -i_max, i_max)
+        if abs(err) > 0.05:
+            self.prev_sign = 1.0 if err > 0 else -1.0
+        pid_steer = (p('kp').value * err
+                     + p('ki').value * self.integral
+                     + p('kd').value * derr)
+        # Gain scheduling: the same correction is twitchier at high speed, so soften it.
+        ref = p('pid_ref_speed').value
+        if ref > 0.0 and v > ref:
+            pid_steer *= clamp(ref / v, 0.5, 1.0)
+        steer = clamp((1.0 - w) * pid_steer + w * gap, -1.0, 1.0)
+
+        # ---- speed ----
+        vmin, vmax = p('min_throttle').value, p('max_throttle').value
+        t_boost = max(p('straight_throttle').value, vmax)
+        v_top = vmax * K
+        v_corner = p('corner_speed').value
+
+        # Straight boost: long clear road ahead, no turn showing, centred, not steering.
+        # Each condition fades the boost smoothly (quadratically, so small wobbles cost little).
+        b_full = min(p('boost_full').value, 0.9 * cap_far)
+        b_start = min(p('boost_start').value, 0.5 * b_full)
+        f_clear = clamp((front_far - b_start) / max(b_full - b_start, 1e-3), 0.0, 1.0)
+        f_straight = clamp(1.0 - (self.sharp_s / max(p('boost_sharp_max').value, 1e-3)) ** 2, 0.0, 1.0)
+        f_steer = clamp(1.0 - (abs(steer) / max(p('boost_steer_max').value, 1e-3)) ** 2, 0.0, 1.0)
+        f_center = clamp(1.0 - (abs(err) / max(p('boost_center_max').value, 1e-3)) ** 2, 0.0, 1.0)
+        boost_target = f_clear * f_straight * f_steer * f_center
+        if boost_target < self.boost:
+            self.boost = boost_target   # lose the boost instantly
+        else:
+            self.boost += p('boost_rise').value * (boost_target - self.boost)
+        v_top_eff = v_top + (t_boost * K - v_top) * self.boost
+
+        # (1) Braking-distance limit from the nearest obstacle in the car's path.
+        d_avail = max(front_far - p('brake_dist').value - v * p('reaction_time').value, 0.0)
+        v_dist = math.sqrt(v_corner ** 2 + 2.0 * p('brake_decel').value * d_avail)
+        # (2) Turn-sharpness limit: current top speed when straight, corner speed when sharp.
+        v_turn = v_corner + (v_top_eff - v_corner) * (1.0 - self.sharp_s) ** p('sharp_curve').value
+        v_safe = min(v_dist, v_turn, v_top_eff)
+        v_safe *= (1.0 - 0.4 * abs(steer))  # already turning hard
+        v_safe = clamp(v_safe, 0.8 * v_corner, v_top_eff)
+
+        excess = v - v_safe
+        if p('max_brake').value > 0.0 and excess > 0.3 and v > 1.0:
+            if v > v_dist + p('brake_margin').value:
+                # Too fast to stop before the obstacle: brake as hard as allowed, right away.
+                throttle = -p('max_brake').value
+            else:
+                throttle = -min(p('max_brake').value, p('brake_gain').value * excess)
+            # Learn how hard the car really brakes (shown in the log, for tuning brake_decel).
+            if src == 'meas' and self.prev_v is not None and dt > 0.0:
+                dec = (self.prev_v - v) / dt
+                if 0.0 < dec < 30.0:
+                    self.decel_est = dec if self.decel_est == 0.0 else 0.9 * self.decel_est + 0.1 * dec
+        else:
+            throttle = clamp(v_safe / K, vmin, t_boost)
+        self.prev_v = v
+        self.last_throttle = throttle
+
+        self.pub_steer.publish(Float32(data=float(steer)))
+        self.pub_throttle.publish(Float32(data=float(throttle)))
+
+        self.get_logger().info(
+            f'front={front_far:.2f} L={left:.2f} R={right:.2f} v={v:.1f}({src}) '
+            f'safe={v_safe:.1f} (dist={v_dist:.1f} turn={v_turn:.1f} top={v_top_eff:.1f}) '
+            f'sharp={sharp_signed:+.2f}/{self.sharp_s:.2f} boost={self.boost:.2f} w={w:.2f} '
+            f'line={self.line_bias:+.2f} steer={steer:+.2f} thr={throttle:+.2f} '
+            f'brake_decel_seen={self.decel_est:.1f}',
+            throttle_duration_sec=p('log_period').value)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = WallFollowNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
