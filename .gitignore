@@ -1,0 +1,8 @@
+/*
+!/autodrive_devkit/
+!/.gitignore
+build/
+install/
+log/
+__pycache__/
+*.pyc
