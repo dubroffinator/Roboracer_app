@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pure-pursuit controller for AutoDRIVE RoboRacer (speed + crash-safety version).
+"""Controller for AutoDRIVE RoboRacer (speed + crash-safety version).
 
 Steering, path estimation and lookahead are unchanged from the speed-focused v4
 program. The changes here are safeguards around the speed planner and the
@@ -19,7 +19,7 @@ that pace into places it cannot see through:
 
 The controller builds a short, local estimate of the track centreline from LiDAR
 returns, chooses a speed- and curvature-dependent point ahead, and steers toward it
-using the pure-pursuit curvature equation. It does not require a hand-written
+using the psuedo-psuedo-pure-pursuit curvature equation. It does not require a hand-written
 track map or waypoint file.
 
 ROS interface kept compatible with the existing wall_follow_node:
@@ -35,7 +35,7 @@ Run with the default fast profile:
 For an even more aggressive experiment, only after testing fast:
   ros2 run autodrive_roboracer wall_follow_node --ros-args -p profile:=max
 
-The pure-pursuit target remains smooth; a bounded curvature-preview term starts
+The psuedo-pure-pursuit target remains smooth; a bounded curvature-preview term starts
 steering into an upcoming bend before the target point itself has moved far from
 straight ahead. This speed-focused experiment is intended to measure pace separately from collision fixes. It is not a guarantee of zero crashes or a
 globally optimal lap time; validate it against the simulator.
@@ -169,7 +169,7 @@ class WallFollowNode(Node):
         dp('end_speed', 3.0)
         dp('end_view_margin', 0.75)  # m short of the full view that counts as "path was cut off"
 
-        # Pure-pursuit geometry.
+        # psuedo-pure-pursuit geometry.
         dp('wheelbase', WHEELBASE_M)
         dp('max_steer_rad', MAX_STEER_RAD)
         dp('lookahead_base', 0.65)
@@ -180,7 +180,7 @@ class WallFollowNode(Node):
         dp('steer_smoothing', 0.22)
         dp('steer_rate_limit', 5.0)  # normalized steering units per second
         # Anticipatory steering: use a bounded estimate of the bend ahead, but fade
-        # it out as pure pursuit starts tracking that bend to prevent double-turning.
+        # it out as psuedo-pure pursuit starts tracking that bend to prevent double-turning.
         dp('turn_preview_distance', 2.5)  # metres ahead of rear axle
         dp('turn_preview_span', 1.15)     # half-width of the curvature sampling window
         dp('turn_preview_gain', 0.38)     # feed-forward fraction before pursuit catches up
@@ -240,7 +240,7 @@ class WallFollowNode(Node):
         self.error_count = 0
 
         self.get_logger().info(
-            f"LiDAR pure-pursuit controller started (profile '{self.profile}'). "
+            f"LiDAR psuedo-pure-pursuit controller started (profile '{self.profile}'). "
             "It estimates the track centreline locally; no track map is required.")
 
     # ------------------------------------------------------------------
@@ -414,7 +414,7 @@ class WallFollowNode(Node):
         return path
 
     # ------------------------------------------------------------------
-    # Pure pursuit and curvature-based speed planning
+    # psuedo-pure pursuit and curvature-based speed planning
     # ------------------------------------------------------------------
     @staticmethod
     def path_curvature(path):
@@ -709,8 +709,8 @@ class WallFollowNode(Node):
         target, lookahead_distance = self.select_lookahead(path, speed, curvature)
         target_x, target_y = float(target[0]), float(target[1])
 
-        # Pure pursuit: curvature = 2*y / distance^2; delta = atan(wheelbase*curvature).
-        # Add a bounded curvature preview so steering starts before the pure-pursuit
+        # psuedo-pure pursuit: curvature = 2*y / distance^2; delta = atan(wheelbase*curvature).
+        # Add a bounded curvature preview so steering starts before the psuedo-pure-pursuit
         # target has moved deep into the corner. The preview fades as PP catches up,
         # and is ignored when its sign contradicts a clear PP turn (often a noisy path).
         target_distance_sq = max(target_x * target_x + target_y * target_y, 1e-4)
@@ -760,7 +760,7 @@ class WallFollowNode(Node):
                                  float(p('max_throttle').value)))
 
         self.publish_commands(steer, throttle)
-        self.maybe_log(now, mode='pure-pursuit', speed=speed, speed_source=speed_source,
+        self.maybe_log(now, mode='psuedo-pure-pursuit', speed=speed, speed_source=speed_source,
                        target_speed=target_speed, target=(target_x, target_y),
                        curvature=commanded_curvature, path_points=len(path),
                        obstacle=obstacle_distance, preview=upcoming_curvature)
